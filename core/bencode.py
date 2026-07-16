@@ -50,3 +50,43 @@ def decode_dict(data: bytes, index: int) -> dict:
         index = value[1]
         result[key[0]] = value[0]
     return (result, index + 1)
+
+
+def encode(value) -> bytes:
+    if isinstance(value, int):
+        return encode_int(value)
+    if isinstance(value, bytes):
+        return encode_bytes(value)
+    if isinstance(value, list):
+        return encode_list(value)
+    if isinstance(value, dict):
+        return encode_dict(value)
+    else:
+        raise TypeError(f"Тип данных {type(value)} не поддерживает")
+
+
+def encode_int(value: int) -> bytes:
+    return f"i{value}e".encode()
+
+
+def encode_bytes(value: bytes) -> bytes:
+    return f"{len(value)}:".encode() + value
+
+
+def encode_list(value: list) -> bytes:
+    result = b"l"
+
+    for x in value:
+        result += encode(x)
+    result += b"e"
+    return result
+
+
+def encode_dict(value: dict) -> bytes:
+    value = dict(sorted(value.items()))
+    result = b"d"
+
+    for key, val in value.items():
+        result += encode(key) + encode(val)
+    result += b"e"
+    return result
