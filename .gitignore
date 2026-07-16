@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+*.torrent
+downloads/
+.pytest_cache/
