@@ -1,0 +1,17 @@
+# BitTorrent protocol constants
+
+PSTR = b"BitTorrent protocol"
+PSTRLEN = len(PSTR)
+HANDSHAKE_LENGTH = 1 + PSTRLEN + 8 + 20 + 20
+INFO_HASH_LEN = 20
+PEER_ID_LEN = 20
+
+CHOKE = 0
+UNCHOKE = 1
+INTERESTED = 2
+NOT_INTERESTED = 3
+HAVE = 4
+BITFIELD = 5
+REQUEST = 6
+PIECE = 7
+CANCEL = 8
