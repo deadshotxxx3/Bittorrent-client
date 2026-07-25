@@ -1,14 +1,8 @@
 import socket, struct
 from core.constants import *
-from hashlib import sha1
-from math import ceil
 
 
 class PeerError(Exception):
-    pass
-
-
-class PieceHashError(Exception):
     pass
 
 
