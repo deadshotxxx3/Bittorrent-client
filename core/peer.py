@@ -25,7 +25,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
 
 def connect_to_peer(ip: str, port: int, info_hash: bytes, peer_id: bytes) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(60)
+    sock.settimeout(5)
     sock.connect((ip,port))
     sock.sendall(build_handshake(info_hash,peer_id))
 
