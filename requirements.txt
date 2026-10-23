@@ -1,3 +1,4 @@
 pytest
 requests
 libtorrent
+PySide6
