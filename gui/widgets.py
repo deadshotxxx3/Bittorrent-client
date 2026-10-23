@@ -88,7 +88,7 @@ class ProgressDelegate(QStyledItemDelegate):
         if option.state & QStyle.State_Selected:
             painter.fillRect(option.rect, QColor(124, 140, 255, 36))
         elif option.state & QStyle.State_MouseOver:
-            painter.fillRect(option.rect, QColor(255, 255, 255, 8))
+            painter.fillRect(option.rect, QColor(128, 128, 128, 28))
         if info is None:
             painter.restore()
             return

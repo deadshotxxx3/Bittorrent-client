@@ -6,8 +6,9 @@ from gui import theme
 from gui.formatting import fmt_eta, fmt_size, fmt_speed
 from gui.widgets import PROGRESS_ROLE
 
-HEADERS = ["НАЗВАНИЕ", "РАЗМЕР", "ПРОГРЕСС", "СКАЧИВАНИЕ", "ОТДАЧА", "ПИРЫ", "ОСТАЛОСЬ", "СТАТУС"]
+HEADERS = ["НАЗВАНИЕ", "РАЗМЕР", "ПРОГРЕСС", "СКАЧИВАНИЕ", "ОТДАЧА", "ПИРЫ", "ОСТАЛОСЬ", "СТАТУС", "КАТЕГОРИЯ"]
 STATUS_COLUMN = 7
+CATEGORY_COLUMN = 8
 
 
 class TorrentModel(QAbstractTableModel):
@@ -28,9 +29,17 @@ class TorrentModel(QAbstractTableModel):
             return int(Qt.AlignLeft | Qt.AlignVCenter)
         return None
 
+    @staticmethod
+    def _category_text(t: TorrentInfo) -> str:
+        parts = []
+        if t.category:
+            parts.append(t.category)
+        parts.extend(f"#{tag}" for tag in t.tags)
+        return "  ".join(parts) if parts else "—"
+
     def _display(self, t: TorrentInfo, column: int):
         if column == 0:
-            return t.name
+            return ("⇢  " if t.sequential else "") + t.name
         if column == 1:
             return fmt_size(t.size) if t.size else "—"
         if column == 2:
@@ -47,12 +56,14 @@ class TorrentModel(QAbstractTableModel):
             return fmt_eta(t.eta)
         if column == 7:
             return "●  " + theme.STATE_TITLES.get(t.state, t.state)
+        if column == 8:
+            return self._category_text(t)
         return None
 
     def _sort(self, t: TorrentInfo, column: int):
         return (
-            t.name.lower(), t.size, t.progress, t.down_rate,
-            t.up_rate, t.peers, t.eta if t.eta >= 0 else 10 ** 12, t.state,
+            t.name.lower(), t.size, t.progress, t.down_rate, t.up_rate, t.peers,
+            t.eta if t.eta >= 0 else 10 ** 12, t.state, t.category.lower(),
         )[column]
 
     def data(self, index, role=Qt.DisplayRole):
@@ -71,7 +82,7 @@ class TorrentModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             if column == STATUS_COLUMN:
                 return QColor(theme.STATE_COLORS.get(t.state, theme.TEXT))
-            if column in (1, 5, 6):
+            if column in (1, 5, 6, CATEGORY_COLUMN):
                 return QColor(theme.MUTED)
             if column == 3 and t.down_rate:
                 return QColor(theme.ACCENT_2)
@@ -112,6 +123,10 @@ class FilterProxy(QSortFilterProxyModel):
     def matches(category: str, t: TorrentInfo) -> bool:
         if category == "all":
             return True
+        if category.startswith("cat:"):
+            return t.category == category[4:]
+        if category.startswith("tag:"):
+            return category[4:] in t.tags
         if category == "downloading":
             return t.state in ("downloading", "metadata", "checking") and not t.paused
         if category == "completed":
@@ -124,6 +139,8 @@ class FilterProxy(QSortFilterProxyModel):
 
     def filterAcceptsRow(self, source_row, source_parent):
         t = self.sourceModel().items[source_row]
-        if self.text and self.text not in t.name.lower():
-            return False
+        if self.text:
+            haystack = (t.name + " " + t.category + " " + " ".join(t.tags)).lower()
+            if self.text not in haystack:
+                return False
         return self.matches(self.category, t)

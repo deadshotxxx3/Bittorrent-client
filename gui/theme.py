@@ -1,26 +1,21 @@
-BG = "#0e1017"
-SURFACE = "#151824"
-SURFACE_2 = "#1c2030"
-SURFACE_3 = "#252a3d"
-BORDER = "#2a3047"
-TEXT = "#e8ebf5"
-MUTED = "#8b93ab"
-ACCENT = "#7c8cff"
-ACCENT_2 = "#22d3ee"
-GREEN = "#34d399"
-ORANGE = "#fbbf24"
-RED = "#f87171"
-GREY = "#6b7390"
-
-STATE_COLORS = {
-    "downloading": ACCENT,
-    "metadata": ORANGE,
-    "checking": ORANGE,
-    "completed": GREEN,
-    "seeding": GREEN,
-    "paused": GREY,
-    "error": RED,
+PALETTES = {
+    "dark": {
+        "BG": "#0e1017", "SURFACE": "#151824", "SURFACE_2": "#1c2030", "SURFACE_3": "#252a3d",
+        "BORDER": "#2a3047", "TEXT": "#e8ebf5", "MUTED": "#8b93ab", "ACCENT": "#7c8cff",
+        "ACCENT_2": "#22d3ee", "GREEN": "#34d399", "ORANGE": "#fbbf24", "RED": "#f87171",
+        "GREY": "#6b7390", "ON_ACCENT": "#0b0d14",
+    },
+    "light": {
+        "BG": "#f3f5fb", "SURFACE": "#ffffff", "SURFACE_2": "#eef1f9", "SURFACE_3": "#dde3f1",
+        "BORDER": "#d3d9ea", "TEXT": "#1a2033", "MUTED": "#68718e", "ACCENT": "#5865f2",
+        "ACCENT_2": "#0891b2", "GREEN": "#059669", "ORANGE": "#d97706", "RED": "#dc2626",
+        "GREY": "#8a92a8", "ON_ACCENT": "#ffffff",
+    },
 }
+
+BG = SURFACE = SURFACE_2 = SURFACE_3 = BORDER = TEXT = MUTED = ""
+ACCENT = ACCENT_2 = GREEN = ORANGE = RED = GREY = ON_ACCENT = ""
+STATE_COLORS = {}
 
 STATE_TITLES = {
     "downloading": "Загрузка",
@@ -32,7 +27,26 @@ STATE_TITLES = {
     "error": "Ошибка",
 }
 
-STYLESHEET = f"""
+
+def set_theme(name: str) -> str:
+    global STATE_COLORS
+    if name not in PALETTES:
+        name = "dark"
+    globals().update(PALETTES[name])
+    STATE_COLORS = {
+        "downloading": ACCENT,
+        "metadata": ORANGE,
+        "checking": ORANGE,
+        "completed": GREEN,
+        "seeding": GREEN,
+        "paused": GREY,
+        "error": RED,
+    }
+    return build_stylesheet()
+
+
+def build_stylesheet() -> str:
+    return f"""
 * {{
     outline: none;
 }}
@@ -149,7 +163,7 @@ QPushButton:disabled {{
 }}
 QPushButton#primary {{
     border: none;
-    color: #0b0d14;
+    color: {ON_ACCENT};
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT}, stop:1 {ACCENT_2});
 }}
 QPushButton#primary:hover {{
@@ -296,5 +310,58 @@ QSplitter::handle {{
 }}
 QLabel#muted {{
     color: {MUTED};
+}}
+
+QComboBox, QSpinBox, QTimeEdit {{
+    background: {SURFACE_2};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    padding: 8px 12px;
+    min-height: 18px;
+}}
+QComboBox:focus, QSpinBox:focus, QTimeEdit:focus {{
+    border: 1px solid {ACCENT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 26px;
+}}
+QComboBox QAbstractItemView {{
+    background: {SURFACE_2};
+    border: 1px solid {BORDER};
+    selection-background-color: {SURFACE_3};
+    selection-color: {TEXT};
+    outline: none;
+}}
+QCheckBox {{
+    spacing: 8px;
+}}
+QScrollArea {{
+    border: none;
+    background: transparent;
+}}
+QScrollArea > QWidget > QWidget {{
+    background: transparent;
+}}
+QPushButton::menu-indicator {{
+    image: none;
+    width: 0px;
+}}
+QPushButton#themeButton, QPushButton#menuButton {{
+    padding: 9px 0px;
+}}
+QTableWidget {{
+    background: {SURFACE};
+    alternate-background-color: {SURFACE};
+}}
+QTableWidget::item {{
+    padding-left: 8px;
+}}
+QDialog QTableWidget {{
+    border: 1px solid {BORDER};
+    border-radius: 12px;
+}}
+QTabBar::tab:selected {{
+    color: {TEXT};
 }}
 """

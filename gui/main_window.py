@@ -1,20 +1,25 @@
+import dataclasses
 import os
 import subprocess
 import sys
+import threading
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
-    QAbstractItemView, QButtonGroup, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar,
-    QPushButton, QSplitter, QStackedWidget, QTableView, QTableWidget, QTableWidgetItem,
-    QTabWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QFileDialog, QFrame, QGridLayout,
+    QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter, QStackedWidget,
+    QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from core.lt_engine import Engine
+from core.rss import RssStore, run_check
+from core.schedule import Schedule, effective_limits, is_active
 from gui import theme
-from gui.dialogs import MagnetDialog, SettingsDialog
+from gui.dialogs import CategoriesDialog, MagnetDialog, RssDialog, ScheduleDialog, SettingsDialog
 from gui.formatting import fmt_eta, fmt_size, fmt_speed
 from gui.models import FilterProxy, TorrentModel
 from gui.widgets import ProgressDelegate, SpeedGraph, StatCard
@@ -28,19 +33,28 @@ FILTERS = [
 ]
 
 MB = 1024 * 1024
+STATE_DIR = Path.home() / ".bitclient"
+
+
+class RssSignals(QObject):
+    done = Signal(object)
 
 
 class MainWindow(QMainWindow):
     def __init__(self, initial=None):
         super().__init__()
         self.setWindowTitle("BitClient")
-        self.resize(1320, 820)
-        self.setMinimumSize(1000, 640)
+        self.resize(1360, 840)
+        self.setMinimumSize(1040, 660)
         self.setAcceptDrops(True)
 
         self.settings = QSettings("deadshot", "BitClient")
-        self.engine = Engine(Path.home() / ".bitclient")
-        self.apply_limits()
+        self.engine = Engine(STATE_DIR)
+        self.rss = RssStore(STATE_DIR / "rss.json")
+        self.rss_signals = RssSignals()
+        self.rss_signals.done.connect(self.on_rss_done)
+        self.rss_running = False
+        self.last_limits = None
 
         self.model = TorrentModel(self)
         self.proxy = FilterProxy(self)
@@ -48,6 +62,10 @@ class MainWindow(QMainWindow):
         self.items = []
         self.files_key = None
         self.nav_buttons = {}
+        self.dynamic_buttons = {}
+        self.dynamic_signature = None
+        self.current_filter = "all"
+        self.page_titles = dict(FILTERS)
 
         root = QWidget()
         layout = QHBoxLayout(root)
@@ -59,8 +77,12 @@ class MainWindow(QMainWindow):
 
         self.status_left = QLabel("")
         self.statusBar().addWidget(self.status_left, 1)
+        self.status_schedule = QLabel("")
+        self.statusBar().addPermanentWidget(self.status_schedule)
         self.status_right = QLabel("")
         self.statusBar().addPermanentWidget(self.status_right)
+
+        self.apply_limits()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -68,19 +90,42 @@ class MainWindow(QMainWindow):
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self.engine.autosave)
         self.autosave_timer.start(30000)
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.timeout.connect(self.apply_limits)
+        self.schedule_timer.start(30000)
+        self.rss_timer = QTimer(self)
+        self.rss_timer.timeout.connect(lambda: self.check_rss(False))
+        self.rss_timer.start(60000)
 
         for source in initial or []:
             self.add_source(source)
         self.refresh()
+        QTimer.singleShot(5000, lambda: self.check_rss(False))
 
     @property
     def save_dir(self) -> str:
         return self.settings.value("save_dir", str(Path.home() / "Downloads"))
 
+    @property
+    def theme_name(self) -> str:
+        return self.settings.value("theme", "dark")
+
+    def load_schedule(self) -> Schedule:
+        return Schedule.from_json(self.settings.value("schedule", ""))
+
     def apply_limits(self) -> None:
-        down = float(self.settings.value("down_limit", 0))
-        up = float(self.settings.value("up_limit", 0))
-        self.engine.set_limits(down * MB, up * MB)
+        base_down = float(self.settings.value("down_limit", 0))
+        base_up = float(self.settings.value("up_limit", 0))
+        schedule = self.load_schedule()
+        now = datetime.now()
+        down, up = effective_limits(schedule, base_down, base_up, now)
+        if (down, up) != self.last_limits:
+            self.last_limits = (down, up)
+            self.engine.set_limits(down * MB, up * MB)
+        if is_active(schedule, now):
+            self.status_schedule.setText("⏱ расписание активно    ")
+        else:
+            self.status_schedule.setText("")
 
     def build_sidebar(self) -> QWidget:
         side = QFrame()
@@ -96,27 +141,32 @@ class MainWindow(QMainWindow):
         sub.setObjectName("logoSub")
         layout.addWidget(logo)
         layout.addWidget(sub)
-        layout.addSpacing(26)
+        layout.addSpacing(22)
 
         section = QLabel("БИБЛИОТЕКА")
         section.setObjectName("sectionLabel")
         layout.addWidget(section)
         layout.addSpacing(6)
 
-        group = QButtonGroup(self)
-        group.setExclusive(True)
+        self.nav_group = QButtonGroup(self)
+        self.nav_group.setExclusive(True)
         for key, title in FILTERS:
-            button = QPushButton(title)
-            button.setObjectName("navButton")
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _=False, k=key: self.set_category(k))
-            group.addButton(button)
+            button = self.make_nav_button(title, key)
             layout.addWidget(button)
             self.nav_buttons[key] = (button, title)
         self.nav_buttons["all"][0].setChecked(True)
 
-        layout.addStretch(1)
+        layout.addSpacing(12)
+        self.dynamic_host = QWidget()
+        self.dynamic_layout = QVBoxLayout(self.dynamic_host)
+        self.dynamic_layout.setContentsMargins(0, 0, 0, 0)
+        self.dynamic_layout.setSpacing(4)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(self.dynamic_host)
+        layout.addWidget(scroll, 1)
 
         card = QFrame()
         card.setObjectName("graphCard")
@@ -140,6 +190,60 @@ class MainWindow(QMainWindow):
         layout.addWidget(card)
         return side
 
+    def make_nav_button(self, title: str, key: str) -> QPushButton:
+        button = QPushButton(title)
+        button.setObjectName("navButton")
+        button.setCheckable(True)
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(lambda _=False, k=key: self.set_category(k))
+        self.nav_group.addButton(button)
+        return button
+
+    def rebuild_dynamic(self) -> None:
+        categories = sorted(self.engine.categories)
+        tags = sorted({tag for item in self.items for tag in item.tags})
+        signature = (tuple(categories), tuple(tags))
+        if signature != self.dynamic_signature:
+            self.dynamic_signature = signature
+            while self.dynamic_layout.count():
+                child = self.dynamic_layout.takeAt(0)
+                widget = child.widget()
+                if widget is not None:
+                    if isinstance(widget, QPushButton):
+                        self.nav_group.removeButton(widget)
+                    widget.deleteLater()
+            self.dynamic_buttons = {}
+            self.page_titles = dict(FILTERS)
+            if categories:
+                self.dynamic_layout.addWidget(self.section_label("КАТЕГОРИИ"))
+                for name in categories:
+                    self.add_dynamic_button(f"cat:{name}", name, f"▪  {name}")
+            if tags:
+                self.dynamic_layout.addSpacing(8)
+                self.dynamic_layout.addWidget(self.section_label("МЕТКИ"))
+                for name in tags:
+                    self.add_dynamic_button(f"tag:{name}", name, f"#  {name}")
+            self.dynamic_layout.addStretch(1)
+            if self.current_filter not in self.page_titles and self.current_filter not in self.dynamic_buttons:
+                self.set_category("all")
+                self.nav_buttons["all"][0].setChecked(True)
+            elif self.current_filter in self.dynamic_buttons:
+                self.dynamic_buttons[self.current_filter][0].setChecked(True)
+        for key, (button, title) in self.dynamic_buttons.items():
+            count = sum(1 for i in self.items if FilterProxy.matches(key, i))
+            button.setText(f"{title}   {count}")
+
+    def section_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("sectionLabel")
+        return label
+
+    def add_dynamic_button(self, key: str, name: str, title: str) -> None:
+        button = self.make_nav_button(title, key)
+        self.dynamic_layout.addWidget(button)
+        self.dynamic_buttons[key] = (button, title)
+        self.page_titles[key] = name
+
     def build_content(self) -> QWidget:
         content = QFrame()
         content.setObjectName("content")
@@ -161,8 +265,8 @@ class MainWindow(QMainWindow):
         header.addStretch(1)
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Поиск по названию…")
-        self.search.setFixedWidth(240)
+        self.search.setPlaceholderText("Поиск по названию, категории, метке…")
+        self.search.setFixedWidth(280)
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.proxy.set_text)
         header.addWidget(self.search)
@@ -174,13 +278,30 @@ class MainWindow(QMainWindow):
         self.magnet_button = QPushButton("Magnet")
         self.magnet_button.setCursor(Qt.PointingHandCursor)
         self.magnet_button.clicked.connect(self.add_magnet)
-        self.settings_button = QPushButton("⚙")
-        self.settings_button.setFixedWidth(44)
-        self.settings_button.setCursor(Qt.PointingHandCursor)
-        self.settings_button.clicked.connect(self.open_settings)
+
+        self.theme_button = QPushButton()
+        self.theme_button.setObjectName("themeButton")
+        self.theme_button.setFixedWidth(44)
+        self.theme_button.setCursor(Qt.PointingHandCursor)
+        self.theme_button.setToolTip("Светлая / тёмная тема")
+        self.theme_button.clicked.connect(self.toggle_theme)
+        self.update_theme_button()
+
+        self.menu_button = QPushButton("⚙")
+        self.menu_button.setObjectName("menuButton")
+        self.menu_button.setFixedWidth(44)
+        self.menu_button.setCursor(Qt.PointingHandCursor)
+        menu = QMenu(self.menu_button)
+        menu.addAction("Настройки", self.open_settings)
+        menu.addAction("Расписание скоростей", self.open_schedule)
+        menu.addAction("Категории", self.open_categories)
+        menu.addAction("RSS-автозагрузка", self.open_rss)
+        self.menu_button.setMenu(menu)
+
         header.addWidget(self.add_button)
         header.addWidget(self.magnet_button)
-        header.addWidget(self.settings_button)
+        header.addWidget(self.theme_button)
+        header.addWidget(self.menu_button)
         layout.addLayout(header)
 
         actions = QHBoxLayout()
@@ -201,7 +322,6 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
-
         self.stack = QStackedWidget()
         self.stack.addWidget(self.build_drop_zone())
         self.stack.addWidget(self.build_table())
@@ -209,7 +329,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.build_details())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([520, 220])
+        splitter.setSizes([500, 260])
         layout.addWidget(splitter, 1)
         return content
 
@@ -261,7 +381,8 @@ class MainWindow(QMainWindow):
         header.setHighlightSections(False)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for column, width in ((1, 96), (2, 210), (3, 122), (4, 112), (5, 88), (6, 96), (7, 130)):
+        widths = ((1, 92), (2, 190), (3, 116), (4, 104), (5, 84), (6, 92), (7, 120), (8, 150))
+        for column, width in widths:
             header.setSectionResizeMode(column, QHeaderView.Fixed)
             self.table.setColumnWidth(column, width)
         self.table.sortByColumn(0, Qt.AscendingOrder)
@@ -282,28 +403,59 @@ class MainWindow(QMainWindow):
             card = StatCard(title)
             self.cards[key] = card
             grid.addWidget(card, i // 3, i % 3)
-        self.tabs.addTab(overview, "Обзор")
+        grid.setRowStretch(2, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(overview)
+        self.tabs.addTab(scroll, "Обзор")
 
-        self.files_table = QTableWidget(0, 3)
-        self.files_table.setHorizontalHeaderLabels(["ФАЙЛ", "РАЗМЕР", "ПРОГРЕСС"])
-        self.files_table.verticalHeader().setVisible(False)
-        self.files_table.setShowGrid(False)
-        self.files_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.files_table.setSelectionMode(QAbstractItemView.NoSelection)
-        self.files_table.setStyleSheet("QTableWidget { border: none; background: transparent; }")
-        fh = self.files_table.horizontalHeader()
-        fh.setSectionResizeMode(0, QHeaderView.Stretch)
-        fh.setSectionResizeMode(1, QHeaderView.Fixed)
-        fh.setSectionResizeMode(2, QHeaderView.Fixed)
-        self.files_table.setColumnWidth(1, 110)
-        self.files_table.setColumnWidth(2, 200)
+        self.files_table = self.make_table(["ФАЙЛ", "РАЗМЕР", "ПРОГРЕСС"], ((1, 110), (2, 200)))
         self.tabs.addTab(self.files_table, "Файлы")
+
+        self.peers_table = self.make_table(
+            ["АДРЕС", "КЛИЕНТ", "СКАЧИВАНИЕ", "ОТДАЧА", "ПРОГРЕСС"], ((1, 190), (2, 120), (3, 110), (4, 90)))
+        self.tabs.addTab(self.peers_table, "Пиры")
+
+        self.trackers_table = self.make_table(
+            ["ТРЕКЕР", "СТАТУС", "СООБЩЕНИЕ", "ТИР"], ((1, 120), (2, 260), (3, 60)))
+        self.trackers_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.trackers_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.tabs.addTab(self.trackers_table, "Трекеры")
+
         self.tabs.currentChanged.connect(lambda *_: self.update_details())
         return self.tabs
 
+    def make_table(self, headers: list, widths) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setStyleSheet("QTableWidget { border: none; background: transparent; }")
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for column, width in widths:
+            header.setSectionResizeMode(column, QHeaderView.Fixed)
+            table.setColumnWidth(column, width)
+        return table
+
+    def update_theme_button(self) -> None:
+        self.theme_button.setText("☀" if self.theme_name == "dark" else "☾")
+
+    def toggle_theme(self) -> None:
+        name = "light" if self.theme_name == "dark" else "dark"
+        self.settings.setValue("theme", name)
+        QApplication.instance().setStyleSheet(theme.set_theme(name))
+        self.update_theme_button()
+        self.graph.update()
+        self.table.viewport().update()
+
     def set_category(self, key: str) -> None:
+        self.current_filter = key
         self.proxy.set_category(key)
-        self.page_title.setText(dict(FILTERS)[key])
+        self.page_title.setText(self.page_titles.get(key, key))
         self.update_subtitle()
 
     def update_subtitle(self) -> None:
@@ -313,6 +465,10 @@ class MainWindow(QMainWindow):
     def selected_keys(self) -> list[str]:
         rows = self.table.selectionModel().selectedRows()
         return [self.model.items[self.proxy.mapToSource(i).row()].key for i in rows]
+
+    def selected_infos(self) -> list:
+        keys = set(self.selected_keys())
+        return [i for i in self.items if i.key in keys]
 
     def on_selection(self) -> None:
         has = bool(self.selected_keys())
@@ -335,6 +491,7 @@ class MainWindow(QMainWindow):
         for key, (button, title) in self.nav_buttons.items():
             count = sum(1 for i in self.items if FilterProxy.matches(key, i))
             button.setText(f"{title}   {count}")
+        self.rebuild_dynamic()
 
         active = sum(1 for i in self.items if i.state == "downloading")
         self.status_left.setText(f"  Торрентов: {len(self.items)}   •   Активных загрузок: {active}")
@@ -355,7 +512,8 @@ class MainWindow(QMainWindow):
         if info is None:
             for card in self.cards.values():
                 card.set_value("—")
-            self.files_table.setRowCount(0)
+            for table in (self.files_table, self.peers_table, self.trackers_table):
+                table.setRowCount(0)
             self.files_key = None
             return
         self.cards["down"].set_value(fmt_size(info.total_down))
@@ -366,8 +524,13 @@ class MainWindow(QMainWindow):
         self.cards["eta"].set_value(
             "—" if info.state in ("completed", "seeding", "paused") else fmt_eta(info.eta))
         self.cards["path"].set_value(info.save_path)
-        if self.tabs.currentIndex() == 1:
+        index = self.tabs.currentIndex()
+        if index == 1:
             self.update_files(info.key)
+        elif index == 2:
+            self.update_peers(info.key)
+        elif index == 3:
+            self.update_trackers(info.key)
 
     def update_files(self, key: str) -> None:
         files = self.engine.files(key)
@@ -389,27 +552,67 @@ class MainWindow(QMainWindow):
                 bar.setValue(int(entry.progress * 1000))
                 bar.setFormat(f"{entry.progress * 100:.0f}%")
 
-    def add_source(self, source: str, save_dir: str | None = None) -> None:
+    def set_cell(self, table: QTableWidget, row: int, column: int, text: str) -> None:
+        item = table.item(row, column)
+        if item is None:
+            table.setItem(row, column, QTableWidgetItem(text))
+        elif item.text() != text:
+            item.setText(text)
+
+    def update_peers(self, key: str) -> None:
+        peers = self.engine.peers(key)
+        table = self.peers_table
+        if table.rowCount() != len(peers):
+            table.setRowCount(len(peers))
+            for row in range(len(peers)):
+                table.setRowHeight(row, 34)
+        for row, peer in enumerate(peers):
+            self.set_cell(table, row, 0, peer.address)
+            self.set_cell(table, row, 1, peer.client or "—")
+            self.set_cell(table, row, 2, fmt_speed(peer.down) if peer.down else "—")
+            self.set_cell(table, row, 3, fmt_speed(peer.up) if peer.up else "—")
+            self.set_cell(table, row, 4, f"{peer.progress * 100:.0f}%")
+
+    def update_trackers(self, key: str) -> None:
+        trackers = self.engine.trackers(key)
+        table = self.trackers_table
+        if table.rowCount() != len(trackers):
+            table.setRowCount(len(trackers))
+            for row in range(len(trackers)):
+                table.setRowHeight(row, 34)
+        for row, tracker in enumerate(trackers):
+            self.set_cell(table, row, 0, tracker.url)
+            self.set_cell(table, row, 1, tracker.status)
+            self.set_cell(table, row, 2, tracker.message or "—")
+            self.set_cell(table, row, 3, str(tracker.tier))
+
+    def add_source(self, source: str, save_dir: str | None = None, category: str = "") -> None:
         try:
-            self.engine.add(source, save_dir or self.save_dir)
+            self.engine.add(source, save_dir or self.save_dir, category)
         except Exception as e:
             QMessageBox.warning(self, "Не удалось добавить", f"{source[:80]}\n\n{e}")
+
+    def current_category(self) -> str:
+        if self.current_filter.startswith("cat:"):
+            return self.current_filter[4:]
+        return ""
 
     def add_torrent_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self, "Выберите .torrent файлы", str(Path.home()), "Torrent (*.torrent)")
         for file in files:
-            self.add_source(file)
+            self.add_source(file, category=self.current_category())
         self.refresh()
 
     def add_magnet(self) -> None:
-        dialog = MagnetDialog(self.save_dir, self)
+        dialog = MagnetDialog(self.save_dir, sorted(self.engine.categories),
+                              self.current_category(), self)
         clipboard = QGuiApplication.clipboard().text().strip()
         if clipboard.startswith("magnet:"):
             dialog.text.setPlainText(clipboard)
         if dialog.exec():
             for link in dialog.links():
-                self.add_source(link, dialog.save_dir())
+                self.add_source(link, dialog.save_dir(), dialog.category())
             self.refresh()
 
     def open_settings(self) -> None:
@@ -424,7 +627,64 @@ class MainWindow(QMainWindow):
             self.settings.setValue("save_dir", folder)
             self.settings.setValue("down_limit", down)
             self.settings.setValue("up_limit", up)
+            self.last_limits = None
             self.apply_limits()
+
+    def open_schedule(self) -> None:
+        dialog = ScheduleDialog(self.load_schedule(), self)
+        if dialog.exec():
+            self.settings.setValue("schedule", dialog.schedule().to_json())
+            self.last_limits = None
+            self.apply_limits()
+
+    def open_categories(self) -> None:
+        dialog = CategoriesDialog(self.engine.categories, self.save_dir, self)
+        if dialog.exec():
+            self.engine.set_categories(dialog.categories())
+            self.dynamic_signature = None
+            self.refresh()
+
+    def open_rss(self) -> None:
+        feeds = [dataclasses.replace(f) for f in self.rss.feeds]
+        dialog = RssDialog(feeds, sorted(self.engine.categories), self)
+        if dialog.exec():
+            self.rss.feeds = dialog.feeds()
+            self.rss.save()
+            self.check_rss(True)
+
+    def check_rss(self, force: bool) -> None:
+        if self.rss_running or not self.rss.feeds:
+            return
+        self.rss_running = True
+        feeds = [dataclasses.replace(f) for f in self.rss.feeds]
+        seen = list(self.rss.seen)
+        directory = STATE_DIR / "rss_torrents"
+
+        def work():
+            try:
+                result = run_check(feeds, seen, directory, force)
+            except Exception as e:
+                result = ([], [], {}, [str(e)])
+            self.rss_signals.done.emit(result)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_rss_done(self, result) -> None:
+        self.rss_running = False
+        found, new_seen, states, errors = result
+        for guid in new_seen:
+            self.rss.seen[guid] = None
+        for feed in self.rss.feeds:
+            if feed.url in states:
+                feed.last_check, feed.primed = states[feed.url]
+        self.rss.save()
+        for item in found:
+            self.add_source(item.source, self.save_dir, item.category)
+        if found:
+            self.statusBar().showMessage(f"RSS: добавлено торрентов — {len(found)}", 8000)
+            self.refresh()
+        elif errors:
+            self.statusBar().showMessage(f"RSS: {errors[0][:140]}", 8000)
 
     def pause_selected(self) -> None:
         for key in self.selected_keys():
@@ -461,13 +721,48 @@ class MainWindow(QMainWindow):
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-    def show_menu(self, position) -> None:
-        keys = self.selected_keys()
-        if not keys:
+    def set_sequential_selected(self, enabled: bool) -> None:
+        for key in self.selected_keys():
+            self.engine.set_sequential(key, enabled)
+        self.refresh()
+
+    def set_category_selected(self, category: str) -> None:
+        for key in self.selected_keys():
+            self.engine.set_category(key, category)
+        self.refresh()
+
+    def edit_tags(self) -> None:
+        infos = self.selected_infos()
+        if not infos:
             return
+        current = ", ".join(infos[0].tags)
+        text, ok = QInputDialog.getText(
+            self, "Метки", "Метки через запятую:", QLineEdit.Normal, current)
+        if not ok:
+            return
+        tags = [t.strip().lstrip("#") for t in text.split(",")]
+        for info in infos:
+            self.engine.set_tags(info.key, tags)
+        self.refresh()
+
+    def show_menu(self, position) -> None:
+        infos = self.selected_infos()
+        if not infos:
+            return
+        keys = [i.key for i in infos]
         menu = QMenu(self)
         menu.addAction("▶  Продолжить", self.resume_selected)
         menu.addAction("⏸  Пауза", self.pause_selected)
+        menu.addSeparator()
+        sequential = menu.addAction("Последовательная загрузка")
+        sequential.setCheckable(True)
+        sequential.setChecked(all(i.sequential for i in infos))
+        sequential.triggered.connect(lambda checked=False: self.set_sequential_selected(checked))
+        category_menu = menu.addMenu("Категория")
+        category_menu.addAction("— без категории —", lambda: self.set_category_selected(""))
+        for name in sorted(self.engine.categories):
+            category_menu.addAction(name, lambda _=False, n=name: self.set_category_selected(n))
+        menu.addAction("Метки…", self.edit_tags)
         menu.addSeparator()
         menu.addAction("Открыть папку", lambda: self.open_folder(keys[0]))
         menu.addAction("Копировать magnet-ссылку",
@@ -484,21 +779,24 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event):
         mime = event.mimeData()
+        category = self.current_category()
         if mime.hasUrls():
             for url in mime.urls():
                 if url.isLocalFile() and url.toLocalFile().lower().endswith(".torrent"):
-                    self.add_source(url.toLocalFile())
+                    self.add_source(url.toLocalFile(), category=category)
                 elif url.toString().startswith("magnet:"):
-                    self.add_source(url.toString())
+                    self.add_source(url.toString(), category=category)
         elif mime.hasText():
             for line in mime.text().splitlines():
                 if line.strip().startswith("magnet:"):
-                    self.add_source(line.strip())
+                    self.add_source(line.strip(), category=category)
         self.refresh()
         event.acceptProposedAction()
 
     def closeEvent(self, event):
         self.timer.stop()
         self.autosave_timer.stop()
+        self.schedule_timer.stop()
+        self.rss_timer.stop()
         self.engine.shutdown()
         event.accept()
