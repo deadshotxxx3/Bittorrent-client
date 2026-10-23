@@ -19,6 +19,7 @@ from core.lt_engine import Engine
 from core.rss import RssStore, run_check
 from core.schedule import Schedule, effective_limits, is_active
 from gui import theme
+from gui.animations import GlowButton, crossfade, fade_in, pulse, window_fade
 from gui.dialogs import CategoriesDialog, MagnetDialog, RssDialog, ScheduleDialog, SettingsDialog
 from gui.formatting import fmt_eta, fmt_size, fmt_speed
 from gui.models import FilterProxy, TorrentModel
@@ -271,7 +272,7 @@ class MainWindow(QMainWindow):
         self.search.textChanged.connect(self.proxy.set_text)
         header.addWidget(self.search)
 
-        self.add_button = QPushButton("＋  Торрент")
+        self.add_button = GlowButton("＋  Торрент")
         self.add_button.setObjectName("primary")
         self.add_button.setCursor(Qt.PointingHandCursor)
         self.add_button.clicked.connect(self.add_torrent_files)
@@ -348,10 +349,11 @@ class MainWindow(QMainWindow):
         hint = QLabel("или нажмите «Торрент» в правом верхнем углу")
         hint.setObjectName("muted")
         hint.setAlignment(Qt.AlignCenter)
-        button = QPushButton("Выбрать файлы")
+        button = GlowButton("Выбрать файлы")
         button.setObjectName("primary")
         button.setCursor(Qt.PointingHandCursor)
         button.clicked.connect(self.add_torrent_files)
+        pulse(icon)
         layout.addWidget(icon)
         layout.addWidget(title)
         layout.addWidget(hint)
@@ -423,8 +425,12 @@ class MainWindow(QMainWindow):
         self.trackers_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
         self.tabs.addTab(self.trackers_table, "Трекеры")
 
-        self.tabs.currentChanged.connect(lambda *_: self.update_details())
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         return self.tabs
+
+    def on_tab_changed(self, index: int) -> None:
+        fade_in(self.tabs.widget(index), 220, 0.2)
+        self.update_details()
 
     def make_table(self, headers: list, widths) -> QTableWidget:
         table = QTableWidget(0, len(headers))
@@ -447,14 +453,21 @@ class MainWindow(QMainWindow):
     def toggle_theme(self) -> None:
         name = "light" if self.theme_name == "dark" else "dark"
         self.settings.setValue("theme", name)
-        QApplication.instance().setStyleSheet(theme.set_theme(name))
-        self.update_theme_button()
-        self.graph.update()
-        self.table.viewport().update()
+
+        def apply():
+            QApplication.instance().setStyleSheet(theme.set_theme(name))
+            self.update_theme_button()
+            self.graph.update()
+            self.table.viewport().update()
+
+        crossfade(self, apply)
 
     def set_category(self, key: str) -> None:
+        changed = key != self.current_filter
         self.current_filter = key
         self.proxy.set_category(key)
+        if changed:
+            fade_in(self.table, 240, 0.25)
         self.page_title.setText(self.page_titles.get(key, key))
         self.update_subtitle()
 
@@ -480,7 +493,10 @@ class MainWindow(QMainWindow):
     def refresh(self) -> None:
         self.items = self.engine.snapshot()
         self.model.update(self.items)
-        self.stack.setCurrentIndex(1 if self.items else 0)
+        target = 1 if self.items else 0
+        if self.stack.currentIndex() != target:
+            self.stack.setCurrentIndex(target)
+            fade_in(self.stack.currentWidget(), 350)
 
         total_down = sum(i.down_rate for i in self.items)
         total_up = sum(i.up_rate for i in self.items)
@@ -792,6 +808,12 @@ class MainWindow(QMainWindow):
                     self.add_source(line.strip(), category=category)
         self.refresh()
         event.acceptProposedAction()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_appeared", False):
+            self._appeared = True
+            window_fade(self)
 
     def closeEvent(self, event):
         self.timer.stop()

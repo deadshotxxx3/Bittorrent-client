@@ -55,6 +55,7 @@ QMainWindow, QDialog {{
 }}
 QWidget {{
     color: {TEXT};
+    font-family: "Inter", "Segoe UI", "Ubuntu", "Noto Sans", "Helvetica Neue", Arial, sans-serif;
     font-size: 13px;
 }}
 QToolTip {{
@@ -69,7 +70,7 @@ QToolTip {{
     border-right: 1px solid {BORDER};
 }}
 #logo {{
-    font-size: 21px;
+    font-size: 22px;
     font-weight: 800;
     color: {TEXT};
     letter-spacing: 0.5px;
@@ -113,7 +114,7 @@ QPushButton#navButton:checked {{
     font-weight: 600;
 }}
 #cardValue {{
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 700;
 }}
 #speedDown {{
@@ -128,8 +129,9 @@ QPushButton#navButton:checked {{
     background: {BG};
 }}
 #pageTitle {{
-    font-size: 22px;
+    font-size: 24px;
     font-weight: 800;
+    letter-spacing: -0.4px;
 }}
 #pageSub {{
     color: {MUTED};
@@ -180,6 +182,9 @@ QTableView {{
     border-radius: 14px;
     gridline-color: transparent;
     selection-background-color: transparent;
+}}
+QTableView {{
+    font-weight: 500;
 }}
 QTableView::item {{
     padding-left: 10px;

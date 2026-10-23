@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.rss import Feed
+from gui.animations import FadeDialog, GlowButton
 from core.schedule import Schedule
 
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
@@ -32,7 +33,7 @@ def buttons_row(dialog: QDialog, ok_text: str) -> QHBoxLayout:
     row.addStretch(1)
     cancel = QPushButton("Отмена")
     cancel.clicked.connect(dialog.reject)
-    ok = QPushButton(ok_text)
+    ok = GlowButton(ok_text)
     ok.setObjectName("primary")
     ok.clicked.connect(dialog.accept)
     row.addWidget(cancel)
@@ -75,7 +76,7 @@ def wrap_layout(layout) -> QWidget:
     return holder
 
 
-class MagnetDialog(QDialog):
+class MagnetDialog(FadeDialog):
     def __init__(self, default_dir: str, categories: list[str], current: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Добавить magnet-ссылку")
@@ -114,7 +115,7 @@ class MagnetDialog(QDialog):
         return self.category_box.currentData() or ""
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(FadeDialog):
     def __init__(self, save_dir: str, down_mb: float, up_mb: float, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Настройки")
@@ -141,7 +142,7 @@ class SettingsDialog(QDialog):
         return self.folder.path(), self.down.value(), self.up.value()
 
 
-class ScheduleDialog(QDialog):
+class ScheduleDialog(FadeDialog):
     def __init__(self, schedule: Schedule, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Расписание скоростей")
@@ -193,7 +194,7 @@ class ScheduleDialog(QDialog):
         )
 
 
-class CategoriesDialog(QDialog):
+class CategoriesDialog(FadeDialog):
     def __init__(self, categories: dict, default_dir: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Категории")
@@ -262,7 +263,7 @@ class CategoriesDialog(QDialog):
         return result
 
 
-class RssDialog(QDialog):
+class RssDialog(FadeDialog):
     COLUMNS = ["ВКЛ", "НАЗВАНИЕ", "АДРЕС ЛЕНТЫ", "ВКЛЮЧИТЬ (REGEX)", "ИСКЛЮЧИТЬ (REGEX)", "КАТЕГОРИЯ", "МИН"]
 
     def __init__(self, feeds: list[Feed], categories: list[str], parent=None):
