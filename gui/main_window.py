@@ -1,28 +1,37 @@
 import dataclasses
+import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter, QStackedWidget,
-    QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QSystemTrayIcon, QTableView, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from core.lt_engine import Engine
+from core.lt_engine import EXTRA_TRACKERS, Engine
 from core.rss import RssStore, run_check
+from core.stats import Stats
 from core.schedule import Schedule, effective_limits, is_active
-from gui import theme
+from gui import autostart, theme
 from gui.animations import GlowButton, crossfade, fade_in, pulse, window_fade
-from gui.dialogs import CategoriesDialog, MagnetDialog, RssDialog, ScheduleDialog, SettingsDialog
+from gui.dialogs import (
+    DEFAULTS, CategoriesDialog, CreateTorrentDialog, FilesDialog, LimitsDialog, MagnetDialog,
+    RssDialog, ScheduleDialog, SettingsDialog, StatsDialog,
+)
 from gui.formatting import fmt_eta, fmt_size, fmt_speed
-from gui.models import FilterProxy, TorrentModel
+from gui.icons import app_icon
+from gui.models import HEADERS, FilterProxy, TorrentModel
+from gui.power import run_power_action
 from gui.widgets import ProgressDelegate, SpeedGraph, StatCard
 
 FILTERS = [
@@ -35,6 +44,7 @@ FILTERS = [
 
 MB = 1024 * 1024
 STATE_DIR = Path.home() / ".bitclient"
+log = logging.getLogger("bitclient")
 
 
 class RssSignals(QObject):
@@ -52,10 +62,20 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("deadshot", "BitClient")
         self.engine = Engine(STATE_DIR)
         self.rss = RssStore(STATE_DIR / "rss.json")
+        self.stats = Stats(STATE_DIR / "stats.json")
+        self.last_tick = time.monotonic()
         self.rss_signals = RssSignals()
         self.rss_signals.done.connect(self.on_rss_done)
         self.rss_running = False
         self.last_limits = None
+        self.really_quit = False
+        self.engine_down = False
+        self.tray_hint_shown = False
+        self.after_action = "none"
+        self.after_seen_busy = False
+        self.after_pending = False
+        self.after_actions = {}
+        self.setWindowIcon(app_icon())
 
         self.model = TorrentModel(self)
         self.proxy = FilterProxy(self)
@@ -83,13 +103,16 @@ class MainWindow(QMainWindow):
         self.status_right = QLabel("")
         self.statusBar().addPermanentWidget(self.status_right)
 
+        self.engine.apply_config(self.config())
         self.apply_limits()
+        self.build_tray()
+        self.build_shortcuts()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1000)
         self.autosave_timer = QTimer(self)
-        self.autosave_timer.timeout.connect(self.engine.autosave)
+        self.autosave_timer.timeout.connect(self.autosave)
         self.autosave_timer.start(30000)
         self.schedule_timer = QTimer(self)
         self.schedule_timer.timeout.connect(self.apply_limits)
@@ -97,15 +120,36 @@ class MainWindow(QMainWindow):
         self.rss_timer = QTimer(self)
         self.rss_timer.timeout.connect(lambda: self.check_rss(False))
         self.rss_timer.start(60000)
+        self.watch_timer = QTimer(self)
+        self.watch_timer.timeout.connect(self.scan_watch_folder)
+        self.watch_timer.start(10000)
 
         for source in initial or []:
             self.add_source(source)
         self.refresh()
         QTimer.singleShot(5000, lambda: self.check_rss(False))
 
+    def config(self) -> dict:
+        result = {}
+        for key, default in DEFAULTS.items():
+            value = self.settings.value(key, default)
+            try:
+                if isinstance(default, bool):
+                    value = value in (True, "true", "True", "1", 1)
+                elif isinstance(default, int):
+                    value = int(float(value))
+                elif isinstance(default, float):
+                    value = float(value)
+                else:
+                    value = str(value)
+            except (TypeError, ValueError):
+                value = default
+            result[key] = value
+        return result
+
     @property
     def save_dir(self) -> str:
-        return self.settings.value("save_dir", str(Path.home() / "Downloads"))
+        return self.config()["save_dir"]
 
     @property
     def theme_name(self) -> str:
@@ -115,18 +159,243 @@ class MainWindow(QMainWindow):
         return Schedule.from_json(self.settings.value("schedule", ""))
 
     def apply_limits(self) -> None:
-        base_down = float(self.settings.value("down_limit", 0))
-        base_up = float(self.settings.value("up_limit", 0))
+        cfg = self.config()
+        base_down = cfg["down_limit"]
+        base_up = cfg["up_limit"]
         schedule = self.load_schedule()
         now = datetime.now()
-        down, up = effective_limits(schedule, base_down, base_up, now)
+        alt = cfg["alt_active"]
+        if alt:
+            down, up = cfg["alt_down"], cfg["alt_up"]
+        else:
+            down, up = effective_limits(schedule, base_down, base_up, now)
         if (down, up) != self.last_limits:
             self.last_limits = (down, up)
             self.engine.set_limits(down * MB, up * MB)
-        if is_active(schedule, now):
+        if alt:
+            self.status_schedule.setText("🐢 режим ограничения скорости    ")
+        elif is_active(schedule, now):
             self.status_schedule.setText("⏱ расписание активно    ")
         else:
             self.status_schedule.setText("")
+
+    def autosave(self) -> None:
+        self.engine.autosave()
+        try:
+            self.stats.save()
+        except OSError as e:
+            log.warning("stats save failed: %s", e)
+
+    def build_shortcuts(self) -> None:
+        def bind(sequence: str, handler) -> None:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(handler)
+
+        bind("Ctrl+O", self.add_torrent_files)
+        bind("Ctrl+N", self.create_torrent)
+        bind("Ctrl+F", self.focus_search)
+        bind("Ctrl+V", self.paste_magnet)
+        bind("Delete", lambda: self.remove_selected(False))
+        bind("Shift+Delete", lambda: self.remove_selected(True))
+        bind("Space", self.toggle_pause_selected)
+        bind("Ctrl+,", self.open_settings)
+        bind("Ctrl+Q", self.quit_app)
+
+    def focus_search(self) -> None:
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def paste_magnet(self) -> None:
+        links = [line.strip() for line in QGuiApplication.clipboard().text().splitlines()
+                 if line.strip().startswith("magnet:")]
+        for link in links:
+            self.add_source(link, category=self.current_category())
+        if links:
+            self.refresh()
+
+    def toggle_pause_selected(self) -> None:
+        infos = self.selected_infos()
+        if not infos:
+            return
+        if all(i.paused for i in infos):
+            self.resume_selected()
+        else:
+            self.pause_selected()
+
+    def scan_watch_folder(self) -> None:
+        folder = self.config()["watch_dir"]
+        if not folder or not Path(folder).is_dir():
+            return
+        added = False
+        for file in sorted(Path(folder).glob("*.torrent")):
+            try:
+                ok = self.add_source(str(file), category=self.current_category(), ask=False)
+                file.rename(file.with_name(file.name + (".added" if ok else ".failed")))
+                added = added or ok
+            except OSError as e:
+                log.warning("watch folder: %s", e)
+        if added:
+            self.refresh()
+
+    def toggle_alt_speed(self, enabled: bool) -> None:
+        self.settings.setValue("alt_active", enabled)
+        self.last_limits = None
+        self.apply_limits()
+
+    def open_stats(self) -> None:
+        self.stats.save()
+        StatsDialog(self.stats, self).exec()
+
+    def open_log(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(STATE_DIR / "log.txt")))
+
+    def has_space(self, category: str, needed: int) -> bool:
+        target = self.engine.categories.get(category) or self.save_dir
+        try:
+            Path(target).mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(target).free
+        except OSError:
+            return True
+        if needed <= free:
+            return True
+        answer = QMessageBox.question(
+            self, "Мало места",
+            f"Нужно {fmt_size(needed)}, свободно {fmt_size(free)}.\nВсё равно добавить?")
+        return answer == QMessageBox.Yes
+
+    def show_header_menu(self, position) -> None:
+        header = self.table.horizontalHeader()
+        menu = QMenu(self)
+        for column in range(1, len(HEADERS)):
+            action = menu.addAction(HEADERS[column].title())
+            action.setCheckable(True)
+            action.setChecked(not header.isSectionHidden(column))
+            action.triggered.connect(
+                lambda checked=False, c=column: header.setSectionHidden(c, not checked))
+        menu.exec(header.mapToGlobal(position))
+
+    def build_tray(self) -> None:
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(app_icon(), self)
+        self.tray_menu = QMenu()
+        self.tray_menu.addAction("Открыть BitClient", self.show_window)
+        self.tray_menu.addAction("Приостановить все", self.pause_all)
+        self.tray_menu.addAction("Продолжить все", self.resume_all)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("Выход", self.quit_app)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.setToolTip("BitClient")
+        self.tray.activated.connect(self.on_tray_activated)
+        self.tray.show()
+
+    def on_tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self.show_window()
+
+    def show_window(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self) -> None:
+        self.really_quit = True
+        self.close()
+
+    def notify(self, title: str, message: str) -> None:
+        if not self.config()["notify"]:
+            return
+        if self.tray is not None:
+            self.tray.showMessage(title, message, QSystemTrayIcon.Information, 6000)
+        else:
+            self.statusBar().showMessage(f"{title}: {message}", 8000)
+
+    def handle_events(self) -> None:
+        events = list(self.engine.events)
+        del self.engine.events[:]
+        for kind, name, *_ in events:
+            if kind == "finished":
+                self.notify("Загрузка завершена", name)
+            elif kind == "stopped":
+                self.notify("Раздача остановлена", name)
+
+    def set_after_action(self, name: str) -> None:
+        self.after_action = name
+        self.after_seen_busy = False
+        self.after_pending = False
+        action = self.after_actions.get(name)
+        if action is not None and not action.isChecked():
+            action.setChecked(True)
+
+    def check_after_action(self) -> None:
+        if self.after_action == "none" or self.after_pending:
+            return
+        busy = any(i.progress < 1.0 and not i.paused and i.state != "error" for i in self.items)
+        if busy:
+            self.after_seen_busy = True
+        elif self.after_seen_busy:
+            self.after_pending = True
+            QTimer.singleShot(0, self.run_after_action)
+
+    def run_after_action(self) -> None:
+        name = self.after_action
+        titles = {"sleep": "Компьютер уйдёт в сон", "shutdown": "Компьютер будет выключен",
+                  "exit": "BitClient закроется"}
+        remaining = {"value": 30}
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Загрузки завершены")
+        box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+
+        def update_text():
+            box.setText(f"Все загрузки завершены.\n{titles[name]} через {remaining['value']} с.")
+
+        def tick():
+            remaining["value"] -= 1
+            if remaining["value"] <= 0:
+                box.accept()
+            else:
+                update_text()
+
+        update_text()
+        countdown = QTimer(box)
+        countdown.timeout.connect(tick)
+        countdown.start(1000)
+        accepted = box.exec() == QMessageBox.Ok
+        countdown.stop()
+        self.set_after_action("none")
+        if not accepted:
+            return
+        if name == "exit":
+            self.quit_app()
+            return
+        self.shutdown_engine()
+        run_power_action(name)
+        self.quit_app()
+
+    def shutdown_engine(self) -> None:
+        if not self.engine_down:
+            self.engine_down = True
+            self.engine.shutdown()
+
+    def pause_all(self) -> None:
+        self.engine.pause_all()
+        self.refresh()
+
+    def resume_all(self) -> None:
+        self.engine.resume_all()
+        self.refresh()
+
+    def handle_arguments(self, arguments: list) -> None:
+        for argument in arguments:
+            if argument.startswith("magnet:") or argument.lower().endswith(".torrent"):
+                self.add_source(argument, category=self.current_category())
+        self.show_window()
+        self.refresh()
 
     def build_sidebar(self) -> QWidget:
         side = QFrame()
@@ -203,7 +472,8 @@ class MainWindow(QMainWindow):
     def rebuild_dynamic(self) -> None:
         categories = sorted(self.engine.categories)
         tags = sorted({tag for item in self.items for tag in item.tags})
-        signature = (tuple(categories), tuple(tags))
+        trackers = sorted({item.tracker for item in self.items if item.tracker})
+        signature = (tuple(categories), tuple(tags), tuple(trackers))
         if signature != self.dynamic_signature:
             self.dynamic_signature = signature
             while self.dynamic_layout.count():
@@ -224,6 +494,11 @@ class MainWindow(QMainWindow):
                 self.dynamic_layout.addWidget(self.section_label("МЕТКИ"))
                 for name in tags:
                     self.add_dynamic_button(f"tag:{name}", name, f"#  {name}")
+            if trackers:
+                self.dynamic_layout.addSpacing(8)
+                self.dynamic_layout.addWidget(self.section_label("ТРЕКЕРЫ"))
+                for name in trackers:
+                    self.add_dynamic_button(f"trk:{name}", name, f"⌁  {name}")
             self.dynamic_layout.addStretch(1)
             if self.current_filter not in self.page_titles and self.current_filter not in self.dynamic_buttons:
                 self.set_category("all")
@@ -297,6 +572,29 @@ class MainWindow(QMainWindow):
         menu.addAction("Расписание скоростей", self.open_schedule)
         menu.addAction("Категории", self.open_categories)
         menu.addAction("RSS-автозагрузка", self.open_rss)
+        menu.addSeparator()
+        menu.addAction("Создать торрент…", self.create_torrent)
+        self.alt_action = menu.addAction("Режим ограничения скорости")
+        self.alt_action.setCheckable(True)
+        self.alt_action.setChecked(self.config()["alt_active"])
+        self.alt_action.triggered.connect(self.toggle_alt_speed)
+        menu.addAction("Статистика", self.open_stats)
+        menu.addAction("Открыть лог", self.open_log)
+        menu.addAction("Приостановить все", self.pause_all)
+        menu.addAction("Продолжить все", self.resume_all)
+        menu.addSeparator()
+        after_menu = menu.addMenu("После завершения загрузок")
+        group = QActionGroup(after_menu)
+        group.setExclusive(True)
+        for key, title in (("none", "Ничего"), ("sleep", "Спящий режим"),
+                           ("shutdown", "Выключить компьютер"), ("exit", "Закрыть BitClient")):
+            action = QAction(title, after_menu)
+            action.setCheckable(True)
+            action.setChecked(key == "none")
+            action.triggered.connect(lambda _=False, k=key: self.set_after_action(k))
+            group.addAction(action)
+            after_menu.addAction(action)
+            self.after_actions[key] = action
         self.menu_button.setMenu(menu)
 
         header.addWidget(self.add_button)
@@ -383,11 +681,21 @@ class MainWindow(QMainWindow):
         header.setHighlightSections(False)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        widths = ((1, 92), (2, 190), (3, 116), (4, 104), (5, 84), (6, 92), (7, 120), (8, 150))
+        widths = ((1, 92), (2, 190), (3, 116), (4, 104), (5, 84), (6, 92), (7, 120), (8, 150),
+                  (9, 140), (10, 84))
         for column, width in widths:
             header.setSectionResizeMode(column, QHeaderView.Fixed)
             self.table.setColumnWidth(column, width)
-        self.table.sortByColumn(0, Qt.AscendingOrder)
+        header.setSectionsMovable(True)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self.show_header_menu)
+        saved = self.settings.value("header_state")
+        if saved:
+            header.restoreState(saved)
+        else:
+            header.hideSection(9)
+            header.hideSection(10)
+            self.table.sortByColumn(0, Qt.AscendingOrder)
         return self.table
 
     def build_details(self) -> QWidget:
@@ -412,7 +720,8 @@ class MainWindow(QMainWindow):
         scroll.setWidget(overview)
         self.tabs.addTab(scroll, "Обзор")
 
-        self.files_table = self.make_table(["ФАЙЛ", "РАЗМЕР", "ПРОГРЕСС"], ((1, 110), (2, 200)))
+        self.files_table = self.make_table(
+            ["ФАЙЛ", "РАЗМЕР", "ПРОГРЕСС", "ПРИОРИТЕТ"], ((1, 110), (2, 200), (3, 110)))
         self.tabs.addTab(self.files_table, "Файлы")
 
         self.peers_table = self.make_table(
@@ -500,6 +809,13 @@ class MainWindow(QMainWindow):
 
         total_down = sum(i.down_rate for i in self.items)
         total_up = sum(i.up_rate for i in self.items)
+        now = time.monotonic()
+        elapsed = min(now - self.last_tick, 5.0)
+        self.last_tick = now
+        self.stats.add(total_down * elapsed, total_up * elapsed)
+        self.setWindowTitle(
+            f"↓ {fmt_speed(total_down)}  ↑ {fmt_speed(total_up)} — BitClient"
+            if (total_down or total_up) else "BitClient")
         self.graph.push(total_down, total_up)
         self.down_label.setText(f"↓ {fmt_speed(total_down)}")
         self.up_label.setText(f"↑ {fmt_speed(total_up)}")
@@ -516,9 +832,15 @@ class MainWindow(QMainWindow):
             f"Всего скачано: {fmt_size(sum(i.total_down for i in self.items))}  ")
 
         if self.engine.errors:
-            self.statusBar().showMessage(self.engine.errors.pop()[:160], 6000)
+            for message in self.engine.errors:
+                log.warning("%s", message)
+            self.statusBar().showMessage(self.engine.errors[-1][:160], 6000)
             self.engine.errors.clear()
 
+        if self.tray is not None:
+            self.tray.setToolTip(f"BitClient\n↓ {fmt_speed(total_down)}   ↑ {fmt_speed(total_up)}")
+        self.handle_events()
+        self.check_after_action()
         self.update_subtitle()
         self.update_details()
 
@@ -538,7 +860,7 @@ class MainWindow(QMainWindow):
         self.cards["ratio"].set_value(f"{ratio:.2f}")
         self.cards["peers"].set_value(f"{info.peers}  ({info.seeds})")
         self.cards["eta"].set_value(
-            "—" if info.state in ("completed", "seeding", "paused") else fmt_eta(info.eta))
+            "—" if info.state in ("completed", "seeding", "paused", "queued") else fmt_eta(info.eta))
         self.cards["path"].set_value(info.save_path)
         index = self.tabs.currentIndex()
         if index == 1:
@@ -563,6 +885,8 @@ class MainWindow(QMainWindow):
                 self.files_table.setCellWidget(row, 2, bar)
                 self.files_table.setRowHeight(row, 38)
         for row, entry in enumerate(files):
+            priority = "Пропуск" if entry.priority == 0 else ("Высокий" if entry.priority >= 7 else "Обычный")
+            self.set_cell(self.files_table, row, 3, priority)
             bar = self.files_table.cellWidget(row, 2)
             if bar is not None:
                 bar.setValue(int(entry.progress * 1000))
@@ -602,11 +926,27 @@ class MainWindow(QMainWindow):
             self.set_cell(table, row, 2, tracker.message or "—")
             self.set_cell(table, row, 3, str(tracker.tier))
 
-    def add_source(self, source: str, save_dir: str | None = None, category: str = "") -> None:
+    def add_source(self, source: str, save_dir: str | None = None, category: str = "",
+                   ask: bool = True) -> bool:
+        priorities = None
         try:
-            self.engine.add(source, save_dir or self.save_dir, category)
+            if not source.startswith("magnet:"):
+                name, files = self.engine.inspect(source)
+                needed = sum(size for _, size in files)
+                if ask and len(files) > 1:
+                    dialog = FilesDialog(name, [(p, s, 4) for p, s in files], self)
+                    if not dialog.exec():
+                        return False
+                    priorities = dialog.priorities()
+                    needed = sum(size for (_, size), pr in zip(files, priorities) if pr > 0)
+                if ask and not self.has_space(category, needed):
+                    return False
+            self.engine.add(source, save_dir or self.save_dir, category, priorities)
+            return True
         except Exception as e:
+            log.exception("add failed: %s", source[:120])
             QMessageBox.warning(self, "Не удалось добавить", f"{source[:80]}\n\n{e}")
+            return False
 
     def current_category(self) -> str:
         if self.current_filter.startswith("cat:"):
@@ -632,19 +972,75 @@ class MainWindow(QMainWindow):
             self.refresh()
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(
-            self.save_dir,
-            float(self.settings.value("down_limit", 0)),
-            float(self.settings.value("up_limit", 0)),
-            self,
-        )
+        values = self.config()
+        try:
+            values["autostart"] = autostart.is_enabled()
+        except Exception:
+            pass
+        dialog = SettingsDialog(values, self)
         if dialog.exec():
-            folder, down, up = dialog.values()
-            self.settings.setValue("save_dir", folder)
-            self.settings.setValue("down_limit", down)
-            self.settings.setValue("up_limit", up)
+            new = dialog.values()
+            for key, value in new.items():
+                self.settings.setValue(key, value)
+            if new["autostart"] != values["autostart"]:
+                try:
+                    autostart.set_enabled(new["autostart"])
+                except Exception as e:
+                    self.statusBar().showMessage(f"Автозапуск: {e}", 6000)
+            self.engine.apply_config(self.config())
             self.last_limits = None
             self.apply_limits()
+
+    def create_torrent(self) -> None:
+        dialog = CreateTorrentDialog(EXTRA_TRACKERS, self)
+        if dialog.exec() and dialog.start_seeding():
+            parent = str(Path(dialog.source_path()).parent)
+            try:
+                self.engine.add(dialog.result_path, parent)
+            except Exception as e:
+                QMessageBox.warning(self, "Не удалось начать раздачу", str(e))
+            self.refresh()
+
+    def choose_files(self) -> None:
+        infos = self.selected_infos()
+        if not infos:
+            return
+        info = infos[0]
+        files = self.engine.files(info.key)
+        if not files:
+            QMessageBox.information(self, "Файлы", "Метаданные ещё не получены, попробуйте чуть позже.")
+            return
+        dialog = FilesDialog(info.name, [(f.path, f.size, f.priority) for f in files], self)
+        if dialog.exec():
+            self.engine.set_file_priorities(info.key, dialog.priorities())
+            self.files_key = None
+            self.refresh()
+
+    def edit_limits(self) -> None:
+        keys = self.selected_keys()
+        if not keys:
+            return
+        down, up = self.engine.torrent_limits(keys[0])
+        dialog = LimitsDialog(down / MB, up / MB, self)
+        if dialog.exec():
+            new_down, new_up = dialog.values()
+            for key in keys:
+                self.engine.set_torrent_limits(key, int(new_down * MB), int(new_up * MB))
+
+    def recheck_selected(self) -> None:
+        for key in self.selected_keys():
+            self.engine.recheck(key)
+        self.refresh()
+
+    def reannounce_selected(self) -> None:
+        for key in self.selected_keys():
+            self.engine.reannounce(key)
+
+    def move_in_queue(self, where: str) -> None:
+        keys = self.selected_keys()
+        for key in (reversed(keys) if where in ("top", "down") else keys):
+            self.engine.queue_move(key, where)
+        self.refresh()
 
     def open_schedule(self) -> None:
         dialog = ScheduleDialog(self.load_schedule(), self)
@@ -695,7 +1091,7 @@ class MainWindow(QMainWindow):
                 feed.last_check, feed.primed = states[feed.url]
         self.rss.save()
         for item in found:
-            self.add_source(item.source, self.save_dir, item.category)
+            self.add_source(item.source, self.save_dir, item.category, ask=False)
         if found:
             self.statusBar().showMessage(f"RSS: добавлено торрентов — {len(found)}", 8000)
             self.refresh()
@@ -779,6 +1175,15 @@ class MainWindow(QMainWindow):
         for name in sorted(self.engine.categories):
             category_menu.addAction(name, lambda _=False, n=name: self.set_category_selected(n))
         menu.addAction("Метки…", self.edit_tags)
+        menu.addAction("Выбрать файлы…", self.choose_files)
+        menu.addAction("Лимиты скорости…", self.edit_limits)
+        queue_menu = menu.addMenu("Очередь")
+        queue_menu.addAction("В начало", lambda: self.move_in_queue("top"))
+        queue_menu.addAction("Выше", lambda: self.move_in_queue("up"))
+        queue_menu.addAction("Ниже", lambda: self.move_in_queue("down"))
+        queue_menu.addAction("В конец", lambda: self.move_in_queue("bottom"))
+        menu.addAction("Перепроверить файлы", self.recheck_selected)
+        menu.addAction("Обновить анонс трекеров", self.reannounce_selected)
         menu.addSeparator()
         menu.addAction("Открыть папку", lambda: self.open_folder(keys[0]))
         menu.addAction("Копировать magnet-ссылку",
@@ -816,9 +1221,26 @@ class MainWindow(QMainWindow):
             window_fade(self)
 
     def closeEvent(self, event):
+        if not self.really_quit and self.tray is not None and self.config()["tray_close"]:
+            event.ignore()
+            self.hide()
+            if not self.tray_hint_shown:
+                self.tray_hint_shown = True
+                self.tray.showMessage("BitClient", "Приложение продолжает работать в трее",
+                                      QSystemTrayIcon.Information, 4000)
+            return
         self.timer.stop()
         self.autosave_timer.stop()
         self.schedule_timer.stop()
         self.rss_timer.stop()
-        self.engine.shutdown()
+        self.watch_timer.stop()
+        self.settings.setValue("header_state", self.table.horizontalHeader().saveState())
+        try:
+            self.stats.save()
+        except OSError:
+            pass
+        self.shutdown_engine()
+        if self.tray is not None:
+            self.tray.hide()
         event.accept()
+        QApplication.quit()

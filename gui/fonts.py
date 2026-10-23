@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 from PySide6.QtGui import QFont, QFontDatabase
@@ -6,7 +7,8 @@ FALLBACKS = ["Segoe UI", "Ubuntu", "Noto Sans", "Helvetica Neue", "Arial"]
 
 
 def load_fonts() -> QFont:
-    folder = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    folder = base / "assets" / "fonts"
     families = []
     for file in sorted(folder.glob("*.ttf")):
         index = QFontDatabase.addApplicationFont(str(file))

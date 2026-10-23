@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=BitClient
+Comment=Torrent client
+Exec=BITCLIENT_EXEC %U
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=application/x-bittorrent;x-scheme-handler/magnet;

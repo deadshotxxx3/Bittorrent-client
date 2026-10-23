@@ -184,3 +184,44 @@ class ProgressDelegate(QStyledItemDelegate):
         painter.setPen(QColor("#ffffff") if shown > 0.5 else QColor(theme.TEXT))
         painter.drawText(track, Qt.AlignCenter, f"{progress * 100:.1f}%")
         painter.restore()
+
+
+class BarChart(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.setMinimumHeight(190)
+
+    def set_data(self, data: list) -> None:
+        self.data = data
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(8, 10, -8, -26)
+        painter.setPen(QPen(QColor(theme.BORDER), 1, Qt.DotLine))
+        for i in range(0, 5):
+            y = rect.top() + rect.height() * i / 4
+            painter.drawLine(rect.left(), y, rect.right(), y)
+        if not self.data:
+            return
+        peak = max(max(d, u) for _, d, u in self.data) or 1
+        slot = rect.width() / len(self.data)
+        bar = max(min(slot * 0.32, 22), 3)
+        font = painter.font()
+        font.setPointSizeF(8)
+        painter.setFont(font)
+        for i, (day, down, up) in enumerate(self.data):
+            center = rect.left() + slot * (i + 0.5)
+            for offset, value, color in ((-bar / 2 - 1, down, theme.ACCENT_2), (bar / 2 + 1, up, theme.ACCENT)):
+                height = rect.height() * value / peak
+                if height < 1:
+                    continue
+                bar_rect = QRectF(center + offset - bar / 2, rect.bottom() - height, bar, height)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(color))
+                painter.drawRoundedRect(bar_rect, 3, 3)
+            painter.setPen(QColor(theme.MUTED))
+            painter.drawText(QRectF(center - slot / 2, rect.bottom() + 4, slot, 16),
+                             Qt.AlignCenter, day.strftime("%d.%m"))

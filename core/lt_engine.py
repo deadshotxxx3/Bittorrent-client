@@ -1,7 +1,9 @@
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import libtorrent as lt
 
@@ -46,6 +48,9 @@ class TorrentInfo:
     category: str = ""
     tags: tuple = ()
     sequential: bool = False
+    tracker: str = ""
+    added: int = 0
+    ratio: float = 0.0
 
 
 @dataclass
@@ -53,6 +58,7 @@ class FileEntry:
     path: str
     size: int
     progress: float
+    priority: int = 4
 
 
 @dataclass
@@ -87,6 +93,12 @@ class Engine:
         self.meta = self._read_meta()
         self.handles = {}
         self.errors = []
+        self.events = []
+        self.exempt = set()
+        self.ratio_limit = 0.0
+        self.seed_minutes = 0
+        self.filter_path = None
+        self.move_done = ""
         self.session = lt.session({
             "listen_interfaces": f"0.0.0.0:{port},[::]:{port}",
             "enable_dht": True,
@@ -135,6 +147,71 @@ class Engine:
             "upload_rate_limit": int(up_bytes),
         })
 
+    def apply_config(self, cfg: dict) -> None:
+        port = int(cfg.get("port", 6881))
+        interface = str(cfg.get("interface", "")).strip()
+        pack = {
+            "listen_interfaces": f"{interface}:{port}" if interface else f"0.0.0.0:{port},[::]:{port}",
+            "outgoing_interfaces": interface,
+            "active_downloads": int(cfg.get("active_downloads", 0)) or -1,
+            "active_seeds": int(cfg.get("active_seeds", 0)) or -1,
+            "active_limit": 10000,
+            "dont_count_slow_torrents": False,
+        }
+        proxy = str(cfg.get("proxy_type", "none"))
+        proxy_codes = {"none": 0, "socks4": 1, "socks5": 2, "http": 4}
+        code = proxy_codes.get(proxy, 0)
+        has_auth = bool(cfg.get("proxy_user"))
+        if has_auth and code == 2:
+            code = 3
+        elif has_auth and code == 4:
+            code = 5
+        pack["proxy_type"] = code
+        pack["proxy_hostname"] = str(cfg.get("proxy_host", ""))
+        pack["proxy_port"] = int(cfg.get("proxy_port", 1080))
+        pack["proxy_username"] = str(cfg.get("proxy_user", ""))
+        pack["proxy_password"] = str(cfg.get("proxy_pass", ""))
+        pack["proxy_peer_connections"] = True
+        pack["proxy_tracker_connections"] = True
+        pack["proxy_hostnames"] = True
+        encryption = str(cfg.get("encryption", "prefer"))
+        policy = {"force": 0, "prefer": 1, "off": 2}.get(encryption, 1)
+        pack["out_enc_policy"] = policy
+        pack["in_enc_policy"] = policy
+        pack["allowed_enc_level"] = 2 if encryption == "force" else 3
+        try:
+            self.session.apply_settings(pack)
+        except Exception as e:
+            self.errors.append(f"settings: {e}")
+        self.ratio_limit = float(cfg.get("ratio_limit", 0) or 0)
+        self.seed_minutes = int(cfg.get("seed_minutes", 0) or 0)
+        self.move_done = str(cfg.get("move_done", "")).strip()
+        path = str(cfg.get("ip_filter", "")).strip()
+        if path != self.filter_path:
+            self.filter_path = path
+            self._load_ip_filter(path)
+
+    def _load_ip_filter(self, path: str) -> None:
+        ip_filter = lt.ip_filter()
+        if path:
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+                pattern = re.compile(r"(\d+\.\d+\.\d+\.\d+)\s*-\s*(\d+\.\d+\.\d+\.\d+)")
+                for match in pattern.finditer(text):
+                    try:
+                        ip_filter.add_rule(match.group(1), match.group(2), 1)
+                    except Exception:
+                        continue
+            except Exception as e:
+                self.errors.append(f"ip filter: {e}")
+        self.session.set_ip_filter(ip_filter)
+
+    def inspect(self, source: str) -> tuple[str, list]:
+        info = lt.torrent_info(source)
+        storage = info.files()
+        files = [(storage.file_path(i), storage.file_size(i)) for i in range(storage.num_files())]
+        return info.name(), files
+
     def _register(self, params) -> str:
         handle = self.session.add_torrent(params)
         key = handle_key(handle)
@@ -153,7 +230,7 @@ class Engine:
             except Exception as e:
                 self.errors.append(f"{file.name}: {e}")
 
-    def add(self, source: str, save_dir: str, category: str = "") -> str:
+    def add(self, source: str, save_dir: str, category: str = "", priorities=None) -> str:
         target = self.meta["categories"].get(category) or save_dir
         Path(target).mkdir(parents=True, exist_ok=True)
         if source.startswith("magnet:"):
@@ -161,6 +238,8 @@ class Engine:
         else:
             params = lt.add_torrent_params()
             params.ti = lt.torrent_info(source)
+            if priorities:
+                params.file_priorities = list(priorities)
         params.save_path = str(target)
         key = self._register(params)
         entry = self.meta["torrents"].setdefault(key, {"category": "", "tags": []})
@@ -194,6 +273,59 @@ class Engine:
         else:
             handle.unset_flags(lt.torrent_flags.sequential_download)
 
+    def set_file_priorities(self, key: str, priorities: list) -> None:
+        handle = self.handles.get(key)
+        if handle is not None and handle.is_valid():
+            handle.prioritize_files(list(priorities))
+            self._save_one(key)
+
+    def set_torrent_limits(self, key: str, down_bytes: int, up_bytes: int) -> None:
+        handle = self.handles.get(key)
+        if handle is not None and handle.is_valid():
+            handle.set_download_limit(int(down_bytes))
+            handle.set_upload_limit(int(up_bytes))
+            self._save_one(key)
+
+    def torrent_limits(self, key: str) -> tuple:
+        handle = self.handles.get(key)
+        if handle is None or not handle.is_valid():
+            return 0, 0
+        return max(handle.download_limit(), 0), max(handle.upload_limit(), 0)
+
+    def recheck(self, key: str) -> None:
+        handle = self.handles.get(key)
+        if handle is not None and handle.is_valid():
+            handle.force_recheck()
+
+    def reannounce(self, key: str) -> None:
+        handle = self.handles.get(key)
+        if handle is not None and handle.is_valid():
+            try:
+                handle.force_reannounce()
+            except Exception:
+                pass
+
+    def queue_move(self, key: str, where: str) -> None:
+        handle = self.handles.get(key)
+        if handle is None or not handle.is_valid():
+            return
+        action = {
+            "top": handle.queue_position_top,
+            "up": handle.queue_position_up,
+            "down": handle.queue_position_down,
+            "bottom": handle.queue_position_bottom,
+        }.get(where)
+        if action:
+            action()
+
+    def pause_all(self) -> None:
+        for key in list(self.handles):
+            self.pause(key)
+
+    def resume_all(self) -> None:
+        for key in list(self.handles):
+            self.resume(key)
+
     def _save_one(self, key: str) -> None:
         handle = self.handles.get(key)
         if handle is not None and handle.is_valid():
@@ -208,6 +340,7 @@ class Engine:
     def resume(self, key: str) -> None:
         handle = self.handles.get(key)
         if handle:
+            self.exempt.add(key)
             handle.set_flags(lt.torrent_flags.auto_managed)
             handle.resume()
 
@@ -238,11 +371,16 @@ class Engine:
             return []
         storage = info.files()
         progress = handle.file_progress()
+        try:
+            priorities = handle.get_file_priorities()
+        except Exception:
+            priorities = []
         result = []
         for i in range(storage.num_files()):
             size = storage.file_size(i)
             done = progress[i] if i < len(progress) else 0
-            result.append(FileEntry(storage.file_path(i), size, done / size if size else 1.0))
+            priority = priorities[i] if i < len(priorities) else 4
+            result.append(FileEntry(storage.file_path(i), size, done / size if size else 1.0, priority))
         return result
 
     def peers(self, key: str, limit: int = 200) -> list[PeerEntry]:
@@ -310,6 +448,17 @@ class Engine:
         for alert in self.session.pop_alerts():
             if isinstance(alert, lt.save_resume_data_alert):
                 self._store_resume(alert)
+            elif isinstance(alert, lt.torrent_finished_alert):
+                try:
+                    handle = alert.handle
+                    key = handle_key(handle)
+                    self.events.append(("finished", handle.status().name, key))
+                    entry = self.meta["torrents"].get(key, {})
+                    if self.move_done and not entry.get("category"):
+                        Path(self.move_done).mkdir(parents=True, exist_ok=True)
+                        handle.move_storage(self.move_done)
+                except Exception as e:
+                    self.errors.append(f"finish: {e}")
             elif isinstance(alert, (lt.torrent_error_alert, lt.file_error_alert)):
                 self.errors.append(alert.message())
 
@@ -321,15 +470,33 @@ class Engine:
                 continue
             s = handle.status()
             flags = handle.flags()
-            paused = bool(flags & lt.torrent_flags.paused)
+            paused_flag = bool(flags & lt.torrent_flags.paused)
+            managed = bool(flags & lt.torrent_flags.auto_managed)
+            paused = paused_flag and not managed
+            queued = paused_flag and managed
             remaining = max(s.total_wanted - s.total_wanted_done, 0)
             eta = int(remaining / s.download_rate) if s.download_rate > 0 else -1
             if paused:
                 state = "paused"
             elif s.errc.value() != 0:
                 state = "error"
+            elif queued:
+                state = "queued"
             else:
                 state = STATE_LABELS.get(s.state, "downloading")
+            downloaded = max(s.all_time_download, s.total_done)
+            ratio = s.all_time_upload / downloaded if downloaded else 0.0
+            if state in ("seeding", "completed") and key not in self.exempt \
+                    and (self.ratio_limit > 0 or self.seed_minutes > 0):
+                seconds = getattr(s, "seeding_duration", None)
+                if seconds is None:
+                    seconds = getattr(s, "seeding_time", 0)
+                if (self.ratio_limit > 0 and ratio >= self.ratio_limit) or \
+                        (self.seed_minutes > 0 and seconds >= self.seed_minutes * 60):
+                    self.pause(key)
+                    self.events.append(("stopped", s.name, key))
+                    state = "paused"
+                    paused = True
             meta = self.meta["torrents"].get(key, {})
             result.append(TorrentInfo(
                 key=key,
@@ -352,6 +519,9 @@ class Engine:
                 category=meta.get("category", ""),
                 tags=tuple(meta.get("tags", [])),
                 sequential=bool(flags & lt.torrent_flags.sequential_download),
+                tracker=(urlparse(getattr(s, "current_tracker", "") or "").hostname or ""),
+                added=int(getattr(s, "added_time", 0) or 0),
+                ratio=ratio,
             ))
         return result
 

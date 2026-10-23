@@ -2,3 +2,4 @@ pytest
 requests
 libtorrent
 PySide6
+pyinstaller

@@ -24,6 +24,7 @@ STATE_TITLES = {
     "completed": "Завершён",
     "seeding": "Раздача",
     "paused": "Пауза",
+    "queued": "В очереди",
     "error": "Ошибка",
 }
 
@@ -40,6 +41,7 @@ def set_theme(name: str) -> str:
         "completed": GREEN,
         "seeding": GREEN,
         "paused": GREY,
+        "queued": GREY,
         "error": RED,
     }
     return build_stylesheet()
