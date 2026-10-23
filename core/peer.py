@@ -61,6 +61,41 @@ def parse_piece(payload: bytes) -> tuple[int, int, bytes]:
     return (index,begin, payload[8:])
 
 
+def build_block_list(piece_length: int) -> list[tuple[int, int]]:
+    blocks = []
+    begin = 0
+    while begin < piece_length:
+        block_size = min(16384, piece_length - begin)
+        blocks.append((begin, block_size))
+        begin += block_size
+    return blocks
+
+
+def download_piece_pipelined(sock: socket.socket, index: int, piece_length: int, pipeline_depth: int = 10) -> bytes:
+    blocks = build_block_list(piece_length)
+    buffer = bytearray(piece_length)
+    next_to_send = 0
+    received_count = 0
+    for i in range(min(pipeline_depth, len(blocks))):
+        begin, block_size = blocks[next_to_send]
+        payload = build_request_payload(index, begin, block_size)
+        send_message(sock, REQUEST, payload)
+        next_to_send += 1
+    while received_count < len(blocks):
+        msg = recv_message(sock) 
+        if msg is None: continue
+        elif msg[0] == PIECE:
+            recv_index, recv_begin, block_data = parse_piece(msg[1])
+            buffer[recv_begin:recv_begin+len(block_data)] = block_data
+            received_count += 1
+            if next_to_send < len(blocks):
+                begin, block_size = blocks[next_to_send]
+                payload = build_request_payload(index, begin, block_size)
+                send_message(sock, REQUEST, payload)
+                next_to_send += 1
+
+    return bytes(buffer)
+
 def download_piece(sock: socket, index: int, piece_length: int) -> bytes:
     begin = 0
     buffer = bytearray(piece_length)
