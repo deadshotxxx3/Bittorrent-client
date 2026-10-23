@@ -1,5 +1,5 @@
 import pytest 
-from core.bencode import decode
+from legacy.bencode import decode
 
 
 @pytest.mark.parametrize("data,expected",[

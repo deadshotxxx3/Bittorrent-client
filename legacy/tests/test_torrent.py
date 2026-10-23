@@ -1,6 +1,6 @@
 import pytest
-from core.bencode import encode
-from core.torrent import load_torrent, Torrent, FileInfo
+from legacy.bencode import encode
+from legacy.torrent import load_torrent, Torrent, FileInfo
 
 
 def test_load_torrent_single_file():

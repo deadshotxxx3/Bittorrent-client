@@ -1,5 +1,5 @@
 import socket, struct
-from core.constants import *
+from legacy.constants import *
 
 
 class PeerError(Exception):

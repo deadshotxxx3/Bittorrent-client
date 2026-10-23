@@ -1,6 +1,6 @@
-from core.torrent import Torrent
-from core.peer_parsing import parse_peers
-from core.constants import PROTOCOL_ID, TIMEOUT, CONNECT_RESPONSE_SIZE
+from legacy.torrent import Torrent
+from legacy.peer_parsing import parse_peers
+from legacy.constants import PROTOCOL_ID, TIMEOUT, CONNECT_RESPONSE_SIZE
 from urllib.parse import urlparse
 import socket, struct, random
 

@@ -1,5 +1,5 @@
 import pytest
-from core.bencode import encode, decode
+from legacy.bencode import encode, decode
 
 
 @pytest.mark.parametrize("raw", [

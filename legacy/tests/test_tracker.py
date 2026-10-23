@@ -1,6 +1,6 @@
 import struct
 import socket
-from core.tracker import parse_peers
+from legacy.tracker import parse_peers
 
 def test_parse_peers_empty():
     assert parse_peers(b"") == []

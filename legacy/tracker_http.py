@@ -1,7 +1,7 @@
-from core.bencode import decode 
-from core.torrent import load_torrent, Torrent
-from core.peer_parsing import parse_peers
-from core.constants import TIMEOUT
+from legacy.bencode import decode 
+from legacy.torrent import load_torrent, Torrent
+from legacy.peer_parsing import parse_peers
+from legacy.constants import TIMEOUT
 from urllib.parse import quote 
 import requests, os, socket, struct
 

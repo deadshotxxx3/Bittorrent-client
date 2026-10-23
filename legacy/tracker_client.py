@@ -1,6 +1,6 @@
-from core.torrent import Torrent
-from core.tracker_http import get_peers_http, TrackerError
-from core.tracker_udp import get_peers_udp
+from legacy.torrent import Torrent
+from legacy.tracker_http import get_peers_http, TrackerError
+from legacy.tracker_udp import get_peers_udp
 from urllib.parse import urlparse
 
 def get_peers(torrent: Torrent, peer_id: bytes) -> list[tuple[str,int]]:

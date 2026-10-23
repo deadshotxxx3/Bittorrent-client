@@ -1,6 +1,6 @@
-from core.peer import download_piece, PeerError, connect_to_peer, recv_message, send_message, download_piece_pipelined
-from core.torrent import Torrent
-from core.constants import UNCHOKE, INTERESTED
+from legacy.peer import download_piece, PeerError, connect_to_peer, recv_message, send_message, download_piece_pipelined
+from legacy.torrent import Torrent
+from legacy.constants import UNCHOKE, INTERESTED
 from hashlib import sha1
 from math import ceil
 import socket, os, queue, threading, time

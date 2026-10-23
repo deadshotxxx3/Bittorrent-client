@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from core.bencode import decode, encode
+from legacy.bencode import decode, encode
 import hashlib
 
 @dataclass

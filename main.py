@@ -1,5 +1,7 @@
 import argparse
+
 from core.lt_downloader import download
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Торрент-клиент на libtorrent")
